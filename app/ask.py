@@ -13,6 +13,8 @@
 """
 
 import argparse
+from dataclasses import dataclass
+from time import perf_counter
 
 from google import genai
 from google.genai import errors
@@ -27,11 +29,26 @@ MODEL_NAMES = tuple(
 )[:3]
 
 
+@dataclass(frozen=True)
+class AskResult:
+    text: str
+    input_tokens: int | None
+    output_tokens: int | None
+
+
+@dataclass(frozen=True)
+class ModelMetrics:
+    model: str
+    elapsed_seconds: float
+    input_tokens: int | None
+    output_tokens: int | None
+
+
 def ask(
     question: str,
     model: str = MODEL,
     history: list[types.Content] | None = None,
-) -> str:
+) -> AskResult:
     client = genai.Client(api_key=get_api_key())
     contents: str | list[types.Content] = question
     if history:
@@ -47,14 +64,10 @@ def ask(
     usage = response.usage_metadata
     input_tokens = usage.prompt_token_count if usage else None
     output_tokens = usage.candidates_token_count if usage else None
-    print(
-        f"[トークン数] 入力: {input_tokens if input_tokens is not None else '不明'}"
-        f" / 出力: {output_tokens if output_tokens is not None else '不明'}"
-    )
 
     if response.text is None:
         raise RuntimeError(f"{model} がテキスト応答を返しませんでした。")
-    return response.text
+    return AskResult(response.text, input_tokens, output_tokens)
 
 
 def _comparison_prompt(question: str, answers: list[tuple[str, str]]) -> str:
@@ -70,6 +83,46 @@ def _comparison_prompt(question: str, answers: list[tuple[str, str]]) -> str:
     )
 
 
+def _metrics_analysis_prompt(question: str, metrics: list[ModelMetrics]) -> str:
+    rows = "\n".join(
+        f"| {metric.model} | {metric.elapsed_seconds:.2f} | "
+        f"{_format_tokens(metric.input_tokens)} | "
+        f"{_format_tokens(metric.output_tokens)} |"
+        for metric in metrics
+    )
+    return (
+        "以下は同じ質問に対する3モデルの実測値です。数値を比較し、日本語で考察してください。\n"
+        "応答時間にはネットワークや混雑などの影響があるため、単発の測定だけでモデルの"
+        "性能差を断定しないでください。トークン数と応答時間の関係を説明してください。\n"
+        "Gemini APIの無料枠は、モデルやプロジェクトごとにRPM（分あたりリクエスト数）、"
+        "TPM（分あたりトークン数）、RPD（日あたりリクエスト数）などの制限があります。"
+        "この測定値だけから具体的な上限値を推測せず、AI Studioで現在のプロジェクトの"
+        "上限を確認する必要があることを説明してください。今回の1質問では、3モデルの"
+        "回答に加えて回答比較と計測値の考察もAPI呼び出しで生成するため、合計5回呼び出す"
+        "ことも踏まえ、無料枠を使う際の注意点を述べてください。\n\n"
+        f"質問: {question}\n\n"
+        "| モデル | 応答時間（秒） | 入力トークン | 出力トークン |\n"
+        "|---|---:|---:|---:|\n"
+        f"{rows}"
+    )
+
+
+def _format_tokens(value: int | None) -> str:
+    return str(value) if value is not None else "不明"
+
+
+def _print_metrics(metrics: list[ModelMetrics]) -> None:
+    print("===== 応答時間・トークン数 =====")
+    print("| モデル | 応答時間（秒） | 入力トークン | 出力トークン |")
+    print("|---|---:|---:|---:|")
+    for metric in metrics:
+        print(
+            f"| {metric.model} | {metric.elapsed_seconds:.2f} | "
+            f"{_format_tokens(metric.input_tokens)} | "
+            f"{_format_tokens(metric.output_tokens)} |"
+        )
+
+
 def _run_question(
     question: str,
     histories: dict[str, list[types.Content]] | None = None,
@@ -77,16 +130,19 @@ def _run_question(
     print(f"[質問] {question}\n")
 
     answers: list[tuple[str, str]] = []
+    metrics: list[ModelMetrics] = []
     had_api_error = False
     for model in MODEL_NAMES:
         print(f"===== {model} =====")
         history = histories[model] if histories is not None else None
+        started_at = perf_counter()
         try:
-            answer = ask(question, model=model, history=history)
+            result = ask(question, model=model, history=history)
         except errors.APIError as e:
             print(api_error_message(e.code, e.message))
             had_api_error = True
             continue
+        elapsed_seconds = perf_counter() - started_at
 
         if history is not None:
             history.extend(
@@ -97,12 +153,20 @@ def _run_question(
                     ),
                     types.Content(
                         role="model",
-                        parts=[types.Part.from_text(text=answer)],
+                        parts=[types.Part.from_text(text=result.text)],
                     ),
                 ]
             )
-        answers.append((model, answer))
-        print(answer)
+        answers.append((model, result.text))
+        metrics.append(
+            ModelMetrics(
+                model=model,
+                elapsed_seconds=elapsed_seconds,
+                input_tokens=result.input_tokens,
+                output_tokens=result.output_tokens,
+            )
+        )
+        print(result.text)
         print()
 
     if had_api_error:
@@ -111,10 +175,29 @@ def _run_question(
 
     print("===== 3モデルの比較・考察 =====")
     try:
-        print(ask(_comparison_prompt(question, answers), model=MODEL_NAMES[0]))
+        comparison_result = ask(
+            _comparison_prompt(question, answers), model=MODEL_NAMES[0]
+        )
     except errors.APIError as e:
         print(api_error_message(e.code, e.message))
         raise SystemExit(1)
+    print(comparison_result.text)
+
+    print()
+    _print_metrics(metrics)
+    print(
+        "\n※ 表は3モデルの回答生成にかかった時間・トークン数です。"
+        "回答比較と計測値の考察にもAPIを使うため、1回の質問で合計5回呼び出します。"
+    )
+    print("\n===== 応答時間・トークン数と無料枠の考察 =====")
+    try:
+        analysis_result = ask(
+            _metrics_analysis_prompt(question, metrics), model=MODEL_NAMES[0]
+        )
+    except errors.APIError as e:
+        print(api_error_message(e.code, e.message))
+        raise SystemExit(1)
+    print(analysis_result.text)
 
 
 def main() -> None:
