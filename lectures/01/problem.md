@@ -82,7 +82,7 @@ GitHub の自分の fork で、`lec01` → `main` の PR を作成します。**
 | レベル | 内容 |
 |---|---|
 | 基礎 | 同じ質問を3回ずつ、モデルを変えて（`AIE_MODEL` 環境変数）、または temperature を変えて実行し、回答の違いを answer.md にまとめる |
-| 実装 | `app/ask.py` を改修し、会話履歴を保ったまま続けて質問できるようにする |
+| 実装 | `uv run python -m app.ask --interactive` を実行し、会話履歴を保ったまま続けて質問する |
 | 発展 | 応答時間とトークン数を計測し、複数のモデルや質問で比較する。無料枠のレート制限との関係も考察する |
 
 モデルの切り替え例：
@@ -92,3 +92,9 @@ AIE_MODEL=gemini-3.5-flash uv run python -m app.ask "LoRAとは何ですか？"
 ```
 
 temperature を変えるには、`generate_content` の `config` 引数を調べてみましょう。
+
+会話履歴を引き継いで質問するには、次のように対話モードを使います。空行で終了し、履歴は実行中だけ保持されます。
+
+```bash
+uv run python -m app.ask --interactive
+```

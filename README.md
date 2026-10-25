@@ -84,7 +84,13 @@ pyproject.toml / uv.lock  依存パッケージとその固定版
 既定モデルは `gemini-3.5-flash-lite` です。環境変数 `AIE_MODEL` で切り替えられます。
 
 ```bash
-AIE_MODEL=gemini-3.5-flash uv run python -m app.ask "LoRAとは何ですか？"
+AIE_MODEL=gemini-3.5-flash-lite uv run python -m app.ask "LoRAとは何ですか？"
 ```
 
 無料枠には1分あたり・1日あたりのリクエスト上限があります。上限は [Gemini API のレート制限のページ](https://ai.google.dev/gemini-api/docs/rate-limits) で確認してください。
+
+会話履歴を引き継いで質問を続けるには、対話モードで起動します。空行で終了します。履歴は実行中のプロセス内だけに保持され、モデルごとに独立しています。
+
+```bash
+uv run python -m app.ask --interactive
+```

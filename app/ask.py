@@ -1,11 +1,12 @@
-"""第1回: 同じ質問を複数のモデルに送り、回答を比較するスクリプト。
+"""第1回: 複数モデルとの会話を続け、回答を比較するスクリプト。
 
 使い方:
     uv run python -m app.ask "LoRAとは何ですか？"
     uv run python -m app.ask            # 質問を省略すると、講座に固有の質問をする
+    uv run python -m app.ask --interactive  # 続けて質問する
 
-ツールも会話履歴も持たない「素の」呼び出し。既定では3つのモデルの回答と、
-それらを比較した考察を出力する。
+ツールは使わず、既定では3つのモデルの回答と、それらを比較した考察を出力する。
+対話モードではモデルごとに会話履歴を保持する。
 講座に固有のことを聞くと、「分からない」と答えるか、一般論でもっともらしく答える
 （講座の実際とは違う）ことを確かめよう。
 （第3回で、用語集を検索できるエージェントにして改善する）
@@ -15,6 +16,7 @@ import argparse
 
 from google import genai
 from google.genai import errors
+from google.genai import types
 
 from app.config import DEFAULT_MODEL, MODEL, api_error_message, get_api_key
 
@@ -25,9 +27,22 @@ MODEL_NAMES = tuple(
 )[:3]
 
 
-def ask(question: str, model: str = MODEL) -> str:
+def ask(
+    question: str,
+    model: str = MODEL,
+    history: list[types.Content] | None = None,
+) -> str:
     client = genai.Client(api_key=get_api_key())
-    response = client.models.generate_content(model=model, contents=question)
+    contents: str | list[types.Content] = question
+    if history:
+        contents = [
+            *history,
+            types.Content(
+                role="user",
+                parts=[types.Part.from_text(text=question)],
+            ),
+        ]
+    response = client.models.generate_content(model=model, contents=contents)
 
     usage = response.usage_metadata
     input_tokens = usage.prompt_token_count if usage else None
@@ -55,25 +70,37 @@ def _comparison_prompt(question: str, answers: list[tuple[str, str]]) -> str:
     )
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="複数のモデルに質問し、回答を比較する"
-    )
-    parser.add_argument("question", nargs="?", default=DEFAULT_QUESTION)
-    args = parser.parse_args()
-
-    print(f"[質問] {args.question}\n")
+def _run_question(
+    question: str,
+    histories: dict[str, list[types.Content]] | None = None,
+) -> None:
+    print(f"[質問] {question}\n")
 
     answers: list[tuple[str, str]] = []
     had_api_error = False
     for model in MODEL_NAMES:
         print(f"===== {model} =====")
+        history = histories[model] if histories is not None else None
         try:
-            answer = ask(args.question, model=model)
+            answer = ask(question, model=model, history=history)
         except errors.APIError as e:
             print(api_error_message(e.code, e.message))
             had_api_error = True
             continue
+
+        if history is not None:
+            history.extend(
+                [
+                    types.Content(
+                        role="user",
+                        parts=[types.Part.from_text(text=question)],
+                    ),
+                    types.Content(
+                        role="model",
+                        parts=[types.Part.from_text(text=answer)],
+                    ),
+                ]
+            )
         answers.append((model, answer))
         print(answer)
         print()
@@ -84,10 +111,46 @@ def main() -> None:
 
     print("===== 3モデルの比較・考察 =====")
     try:
-        print(ask(_comparison_prompt(args.question, answers), model=MODEL_NAMES[0]))
+        print(ask(_comparison_prompt(question, answers), model=MODEL_NAMES[0]))
     except errors.APIError as e:
         print(api_error_message(e.code, e.message))
         raise SystemExit(1)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="複数のモデルに質問し、回答を比較する"
+    )
+    parser.add_argument(
+        "question",
+        nargs="?",
+        help="質問（省略すると講座に固有の既定質問を使用）",
+    )
+    parser.add_argument(
+        "--interactive",
+        action="store_true",
+        help="続けて質問し、各モデルが個別に会話履歴を保持する",
+    )
+    args = parser.parse_args()
+
+    if not args.interactive:
+        _run_question(args.question or DEFAULT_QUESTION)
+        return
+
+    if args.question:
+        parser.error("対話モードでは質問を指定せずに起動してください")
+
+    histories = {model: [] for model in MODEL_NAMES}
+    print("質問を入力してください。空行で終了します。\n")
+    while True:
+        try:
+            question = input("質問> ").strip()
+        except EOFError:
+            print()
+            break
+        if not question:
+            break
+        _run_question(question, histories)
 
 
 if __name__ == "__main__":
