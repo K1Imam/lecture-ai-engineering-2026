@@ -135,9 +135,37 @@ def print_trace(result) -> None:
 
 
 def run_with_approval(target, question: str, model):
+    # usageの累積用
+    total_requests = 0
+    total_tool_calls = 0
+    total_input_tokens = 0
+    total_output_tokens = 0
+    total_cost = 0
+
     result = target.run_sync(question, model=model)
 
-    while isinstance(result.output, DeferredToolRequests):
+    while True:
+        # 今回のrun_syncで発生したusageを加算
+        usage = result.usage
+        total_requests += usage.requests
+        total_tool_calls += usage.tool_calls
+        total_input_tokens += usage.input_tokens
+        total_output_tokens += usage.output_tokens
+
+        if usage.cost is not None:
+            total_cost += usage.cost
+
+        print(
+            f"[DEBUG usage] requests={usage.requests}, "
+            f"tool_calls={usage.tool_calls}, "
+            f"input_tokens={usage.input_tokens}, "
+            f"output_tokens={usage.output_tokens}"
+        )
+
+        # 承認待ちがなければ終了
+        if not isinstance(result.output, DeferredToolRequests):
+            break
+
         approvals = {}
 
         # 承認待ちのツール呼び出しを取得
@@ -164,7 +192,17 @@ def run_with_approval(target, question: str, model):
             deferred_tool_results=DeferredToolResults(approvals=approvals),
         )
 
-    return result
+    # 累積usageを別の属性として保存せず、戻り値をタプルにする
+    total_usage = {
+        "requests": total_requests,
+        "tool_calls": total_tool_calls,
+        "input_tokens": total_input_tokens,
+        "output_tokens": total_output_tokens,
+        "total_tokens": total_input_tokens + total_output_tokens,
+        "cost": total_cost,
+    }
+
+    return result, total_usage
 
 
 def is_retryable_error(error: Exception) -> bool:
@@ -201,7 +239,8 @@ def run_with_retry(target, question: str, model):
 
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
-            return run_with_approval(target, question, model)
+            result, total_usage = run_with_approval(target, question, model)
+            return result, total_usage
 
         except Exception as e:
             # 再試行対象外のエラーなら、そのまま送出
@@ -226,7 +265,7 @@ def run_with_retry(target, question: str, model):
     raise RuntimeError("再試行処理が予期せず終了しました。")
 
 
-def save_run_log(question: str, result):
+def save_run_log(question: str, result, total_usage) -> None:
     """モデルへの入力・出力・TRACEをJSONL形式で保存する。"""
 
     log_path = tools.DATA_DIR / "agent_runs.jsonl"
@@ -260,6 +299,7 @@ def save_run_log(question: str, result):
         "answer": answer,
         "trace": trace,
         "usage": usage,
+        "total_usage": total_usage,
     }
 
     # JSONL形式で追記
@@ -308,11 +348,7 @@ def main() -> None:
     if args.mcp:
         print("[tools] MCP サーバー（app/mcp_servers.json）")
     try:
-        result = run_with_retry(
-            target,
-            args.question,
-            build_model(),
-        )
+        result, total_usage = run_with_retry(target, args.question, build_model())
 
     except ModelHTTPError as e:
         # # エラーもログに残す
@@ -329,11 +365,14 @@ def main() -> None:
         save_run_log(
             question=args.question,
             result=result,
+            total_usage=total_usage,
         )
 
     print(result.output)
     if args.trace:
         print_trace(result)
+
+    print(f"[total usage] {total_usage}")
 
 
 if __name__ == "__main__":
