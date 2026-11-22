@@ -7,8 +7,8 @@
 import json
 from functools import cache
 from pathlib import Path
-from datetime import datetime, timezone
-import random
+
+from app.config import api_error_message
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 MAX_RESULTS = 3
@@ -29,18 +29,12 @@ def _names(entry: dict) -> list[str]:
         _normalize(a) for a in entry["aliases"]
     ]
 
-    # """講座の用語集から用語を検索し、定義と、どの回で扱うかを返す。
-
-    # AIエンジニアリングの用語や、この講座（AIE2026）に固有の言葉について
-    # 答える前に使うこと。query には調べたい用語を1つだけ入れる（例: "LoRA"）。
-    # """
-
 
 def search_glossary(query: str) -> str:
     """講座の用語集から用語を検索し、定義と、どの回で扱うかを返す。
 
     AIエンジニアリングの用語や、この講座（AIE2026）に固有の言葉について
-    答える前に使うこと。query には調べたい用語を１つだけ入れる（例: "LoRA"）。
+    答える前に使うこと。query には調べたい用語を1つだけ入れる（例: "LoRA"）。
     """
     q = _normalize(query)
     if not q:
@@ -89,69 +83,50 @@ def get_lecture_summary(lecture: int) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def save_learning_log(topic: str, summary: str) -> str:
-    """利用者の学習内容を学習記録ファイルに保存する。
+def search_materials(query: str) -> str:
+    """第1〜3回の本講義資料を検索し、関連ページの本文・タイトル・ページ番号を返す。
 
-    学習した内容を記録してほしいと利用者から依頼された場合に使用する。
-    保存する前に、必ず利用者の承認を得ること。
-
-    Args:
-        topic (str): 学習したテーマや用語。
-        summary (str): 学習内容の要約。
-
-    Returns:
-        str: 保存結果を示すメッセージ。
+    queryに調べたい内容を指定する。
     """
-    log_path = DATA_DIR / "learning_log.json"
+    from google.genai.errors import APIError
+    import sqlite3
+    from app.retrieval import search
 
-    # 既存の学習記録を読み込む
-    if log_path.exists():
-        with open(log_path, encoding="utf-8") as f:
-            logs = json.load(f)
-    else:
-        logs = []
-
-    # 新しい学習記録を追加
-    logs.append(
-        {
-            "topic": topic,
-            "summary": summary,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }
-    )
-
-    # JSONファイルに保存
-    with open(log_path, "w", encoding="utf-8") as f:
-        json.dump(logs, f, ensure_ascii=False, indent=2)
-
-    return f"「{topic}」を学習記録に保存しました。"
+    try:
+        return json.dumps({"results": search(query)}, ensure_ascii=False)
+    except (ValueError, FileNotFoundError, sqlite3.Error) as e:
+        return json.dumps({"error": str(e), "results": []}, ensure_ascii=False)
+    except APIError as e:
+        return json.dumps(
+            {"error": api_error_message(e.code), "results": []}, ensure_ascii=False
+        )
 
 
-def make_quiz(lecture: int) -> str:
-    """指定した回の用語から1つを選び、確認問題と答えを返す。
+def browse_tree(node_id: str | None = None) -> str:
+    """目次とページの先頭文を返す。ページIDを指定すると全文を返す。
 
-    「第2回の確認問題を出して」のように、
-    復習用の問題を求められたときに使う。
+    最初はnode_idを省略する。続いて返されたIDを指定して目次をたどる。
     """
+    from app.retrieval import browse_tree as browse
 
-    # 1. 用語集を読み込む
-    terms = load_glossary()
+    try:
+        return json.dumps(browse(node_id), ensure_ascii=False)
+    except (ValueError, OSError) as e:
+        return json.dumps({"error": str(e)}, ensure_ascii=False)
 
-    # 2. 指定した回の用語を集める
-    lecture_terms = [entry for entry in terms if entry.get("lecture") == lecture]
 
-    # 該当する用語がない場合
-    if not lecture_terms:
-        return f"第{lecture}回の用語は用語集に登録されていません。"
+def search_graph(query: str) -> str:
+    """資料を検索し、前後ページ・共通用語をたどって関連ページの本文と引用情報を返す。
 
-    # 3. 用語を1つランダムに選ぶ
-    selected = random.choice(lecture_terms)
+    queryに調べたい内容を指定する。
+    """
+    import sqlite3
+    from google.genai.errors import APIError
+    from app.retrieval import search_graph as search
 
-    # 4. 問題と答えを作成
-    quiz = {
-        "question": f"「{selected['term']}」の意味は？",
-        "answer": selected["definition"],
-    }
-
-    # 5. JSON形式の文字列で返す
-    return json.dumps(quiz, ensure_ascii=False, indent=2)
+    try:
+        return json.dumps(search(query), ensure_ascii=False)
+    except (ValueError, OSError, sqlite3.Error) as e:
+        return json.dumps({"error": str(e)}, ensure_ascii=False)
+    except APIError as e:
+        return json.dumps({"error": api_error_message(e.code)}, ensure_ascii=False)
