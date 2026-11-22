@@ -17,13 +17,16 @@
 import argparse
 import inspect
 import json
-from pathlib import Path
+import random
+import time
 from contextlib import nullcontext
+from pathlib import Path
 from time import perf_counter
+from typing import Callable, TypeVar
 
+from fastmcp import Client
 from pydantic_ai import Agent
 from pydantic_ai.exceptions import ModelHTTPError
-from fastmcp import Client
 from pydantic_ai.mcp import MCPToolset, StdioTransport
 from pydantic_ai.messages import ToolCallPart, ToolReturnPart
 from pydantic_ai.models.google import GoogleModel
@@ -31,8 +34,14 @@ from pydantic_ai.models.test import TestModel
 from pydantic_ai.providers.google import GoogleProvider
 
 from app import tools
-from app.retrieval import run_full_context
 from app.config import MODEL, api_error_message, get_api_key
+from app.retrieval import run_full_context
+
+T = TypeVar("T")
+
+RETRYABLE_HTTP_STATUS_CODES = {408, 429, 500, 502, 503, 504}
+DEFAULT_MAX_RETRIES = 10
+DEFAULT_BASE_DELAY = 2.0
 
 INSTRUCTIONS = """\
 あなたはAIエンジニアリング講座（AIE2026）の学習支援エージェントです。
@@ -87,17 +96,63 @@ agent.tool_plain(tools.search_materials)
 MCP_CONFIG = Path(__file__).resolve().parent / "mcp_servers.json"
 
 
+def _is_retryable_exception(exc: Exception) -> bool:
+    """再試行すべき一時的なエラーかどうかを判定する。"""
+    if isinstance(exc, ModelHTTPError):
+        return exc.status_code in RETRYABLE_HTTP_STATUS_CODES
+    if isinstance(exc, (TimeoutError, ConnectionError, OSError)):
+        return True
+    # ライブラリのラップ例外（httpx / anyio / grpc 等）の Cause チェーンも確認
+    cause = exc.__cause__ or exc.__context__
+    if isinstance(cause, Exception) and cause is not exc:
+        return _is_retryable_exception(cause)
+    return False
+
+
+def _format_exception_brief(exc: Exception) -> str:
+    if isinstance(exc, ModelHTTPError):
+        body_preview = str(exc.body)[:120].replace("\n", " ")
+        return f"HTTP {exc.status_code}: {body_preview}"
+    return f"{type(exc).__name__}: {exc}"
+
+
+def run_with_retry(
+    func: Callable[[], T],
+    *,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    base_delay: float = DEFAULT_BASE_DELAY,
+    label: str = "処理",
+) -> T:
+    """一時的な接続エラーや 429/5xx 応答時に待機して再試行する。"""
+    attempt = 0
+    while True:
+        try:
+            return func()
+        except Exception as exc:
+            if attempt >= max_retries or not _is_retryable_exception(exc):
+                raise
+            attempt += 1
+            # 指数バックオフ + ジッター（0〜0.5秒）で同時再試行の衝突を緩和
+            sleep_seconds = base_delay * (2 ** (attempt - 1)) + random.uniform(0.0, 0.5)
+            print(
+                f"[retry {attempt}/{max_retries}] {label}に失敗したため "
+                f"{sleep_seconds:.1f}秒後に再試行します（{_format_exception_brief(exc)}）",
+                flush=True,
+            )
+            time.sleep(sleep_seconds)
+
+
 def load_mcp_servers(config_path: Path = MCP_CONFIG) -> list[MCPToolset]:
     """設定ファイル（mcpServers 形式）を読み、サーバーごとに接続（MCPToolset）を作る。
 
     - "command" があれば stdio：サーバーをサブプロセスとして起動する
     - "url" があれば Streamable HTTP：起動済みのサーバーに接続する
-    ツール名には「サーバー名_」を付ける（例: glossary_search_glossary）。複数のサーバーに
-    同じ名前のツールがあっても区別できるようにするため。
+        ツール名には「サーバー名_」を付ける（例: glossary_search_glossary）。複数のサーバーに
+        同じ名前のツールがあっても区別できるようにするため。
 
-    Pydantic AI には同じことをする load_mcp_toolsets() もある。ここで自分で組み立てているのは、
-    古い SDK で作られたサーバー（fetch など）につなぐとき、接続方式の自動判定（"auto"）が
-    警告を大量に出すため。"legacy" に固定すると新旧どちらのサーバーにも静かにつながる。
+        Pydantic AI には同じことをする load_mcp_toolsets() もある。ここで自分で組み立てているのは、
+        古い SDK で作られたサーバー（fetch など）につなぐとき、接続方式の自動判定（"auto"）が
+        警告を大量に出すため。"legacy" に固定すると新旧どちらのサーバーにも静かにつながる。
     """
     config = json.loads(Path(config_path).read_text(encoding="utf-8"))["mcpServers"]
     toolsets = []
@@ -187,6 +242,18 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="学習支援エージェントに質問する")
     parser.add_argument("question", nargs="?")
     parser.add_argument("--trace", action="store_true", help="ツール呼び出しを表示する")
+    parser.add_argument(
+        "--retries",
+        type=int,
+        default=DEFAULT_MAX_RETRIES,
+        help=f"接続・APIエラー時の最大リトライ回数（既定: {DEFAULT_MAX_RETRIES}）",
+    )
+    parser.add_argument(
+        "--retry-delay",
+        type=float,
+        default=DEFAULT_BASE_DELAY,
+        help=f"リトライ初期待機秒数（既定: {DEFAULT_BASE_DELAY}）",
+    )
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument(
         "--mcp",
@@ -213,7 +280,21 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    target = build_mcp_agent() if args.mcp else agent
+    try:
+        target = (
+            run_with_retry(
+                lambda: build_mcp_agent(),
+                max_retries=args.retries,
+                base_delay=args.retry_delay,
+                label="MCPサーバー接続",
+            )
+            if args.mcp
+            else agent
+        )
+    except ModelHTTPError as e:
+        print(api_error_message(e.status_code, str(e.body)[:200]))
+        raise SystemExit(1)
+
     mode = nullcontext()
     if args.tree:
         mode = target.override(
@@ -238,18 +319,29 @@ def main() -> None:
         if args.mcp:
             print("[tools] MCP サーバー（app/mcp_servers.json）")
 
+        model = build_model()
         started = perf_counter()
         try:
             if args.full_context:
-                result = run_full_context(
-                    target,
-                    args.question,
-                    build_model(),
-                    instructions=FULL_CONTEXT_INSTRUCTIONS,
-                    prompt_template=FULL_CONTEXT_PROMPT,
+                result = run_with_retry(
+                    lambda: run_full_context(
+                        target,
+                        args.question,
+                        model,
+                        instructions=FULL_CONTEXT_INSTRUCTIONS,
+                        prompt_template=FULL_CONTEXT_PROMPT,
+                    ),
+                    max_retries=args.retries,
+                    base_delay=args.retry_delay,
+                    label="モデル実行（full-context）",
                 )
             else:
-                result = target.run_sync(args.question, model=build_model())
+                result = run_with_retry(
+                    lambda: target.run_sync(args.question, model=model),
+                    max_retries=args.retries,
+                    base_delay=args.retry_delay,
+                    label="モデル実行",
+                )
         except ModelHTTPError as e:
             print(api_error_message(e.status_code, str(e.body)[:200]))
             raise SystemExit(1)
